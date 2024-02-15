@@ -24,7 +24,7 @@ class Args:
 
     # General arguments
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
+    """name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
 
@@ -44,27 +44,27 @@ class Args:
 
     # Algorithm specific arguments
     env_id: str = "CartPole-v0"
-    """the id of the environment"""
+    """id of the environment"""
     total_timesteps: int = 100500
     """total timesteps of the experiments"""
     buffer_size: int = 100000
-    """the replay memory buffer size"""
+    """replay memory buffer size"""
     gamma: float = 0.99
-    """the discount factor gamma"""
+    """discount factor gamma"""
     tau: float = 0.005
-    """the target network update rate"""
+    """target network update rate"""
     batch_size: int = 256
-    """the batch size of sample from the reply memory"""
+    """batch size of sample from the reply memory"""
     learning_starts: int = 5000
     """timestep to start learning"""
     policy_lr: float = 3e-4
-    """the learning rate of the policy network optimizer"""
+    """learning rate of the policy network optimizer"""
     q_lr: float = 3e-4
-    """the learning rate of the Q network network optimizer"""
+    """learning rate of the Q network network optimizer"""
     policy_frequency: int = 2
-    """the frequency of training policy (delayed)"""
+    """frequency of training policy (delayed)"""
     target_network_frequency: int = 1
-    """the frequency of updates for the target networks"""
+    """frequency of updates for the target networks"""
     alpha: float = 0.2
     """entropy regularization coefficient"""
     autotune: bool = True
