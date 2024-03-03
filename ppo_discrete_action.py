@@ -1,21 +1,23 @@
-import os
-import random
-import time
-from dataclasses import dataclass
-from typing import Tuple
-from functools import partial
+"""An end-to-end JAX implementation of PPO designed for discrete actions, based on a combination of CleanRL's and PureJaxRL's styles of algorithm implementations."""
 
-import flax
+import os
+from dataclasses import dataclass
+from typing import Any, Callable, NamedTuple, Tuple
+
+import chex
 import flax.linen as nn
-import gymnasium as gym
+import gymnax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
-from flax.training.train_state import TrainState
 from flax.linen.initializers import constant, orthogonal
+from flax.training.train_state import TrainState
+from gymnax.environments import environment
+
 import wandb
+from wrappers import FlattenObservationWrapper, LogWrapper
 
 
 @dataclass
@@ -29,9 +31,9 @@ class Args:
     """seed of the experiment"""
 
     # Weights & Biases specific arguments
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project: str = "jaxtest1"
+    wandb_project: str = "ppo_discrete_action"
     """"wandb project name"""
     wandb_dir: str = "./"
     """"wandb project directory"""
@@ -43,9 +45,9 @@ class Args:
     """wandb job_type name, for categorizing runs in a group"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v0"
+    env_id: str = "CartPole-v1"
     """id of the environment"""
-    total_timesteps: int = 100500
+    total_timesteps: int = 100000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """learning rate of the optimizer"""
@@ -101,42 +103,39 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id: str, seed: int) -> gym.Env:
-    """Initializes Gymnasium environment.
+def make_env(env_id: str) -> environment.Environment:
+    """Initializes Gymnax environment.
 
     Parameters
     ----------
     env_id : str
-        ID for the Gymnasium environment.
+        ID for the Gymnax environment.
     seed : int
         Seed.
 
     Returns
     -------
-    gym.Env
-        Gymnasium environment.
+    Environment
+        Gymnax environment.
     """
+    env, env_params = gymnax.make(env_id)
+    env = FlattenObservationWrapper(env)
+    env = LogWrapper(env)
 
-    def thunk():
-        env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env.action_space.seed(seed)
-        return env
-
-    return thunk
+    return env, env_params
 
 
 class Critic(nn.Module):
     """Model for representing the PPO critic."""
 
     @nn.compact
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs: chex.Array) -> chex.Array:
         """
         Computes state-values for input observations.
 
         Returns
         -------
-        state_values : jnp.ndarray
+        state_values : chex.Array
             Computed state-values.
         """
         x = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
@@ -163,13 +162,13 @@ class Actor(nn.Module):
     action_dim: int
 
     @nn.compact
-    def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, obs: chex.Array) -> chex.Array:
         """
         Computes action logits for input observations.
 
         Returns
         -------
-        action_logits : jnp.ndarray
+        action_logits : chex.Array
             Computed action logits.
         """
         x = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
@@ -184,28 +183,27 @@ class Actor(nn.Module):
         return action_logits
 
 
-@jax.jit
 def sample_actions(
-    logits: jnp.ndarray,
-    sampling_key: jax.Array,
-):
+    logits: chex.Array,
+    sampling_key: chex.PRNGKey,
+) -> Tuple[chex.Array, chex.Array, chex.Array]:
     """
-    Calculates actions and probabilities.
+    Calculates probabilities based on sampled actions.
 
     Parameters
     ----------
-    logits : jnp.ndarray
+    logits : chex.Array
         Action logits output from actor network.
-    sampling_key : jax.Array
+    sampling_key : chex.PRNGKey
         RNG key.
 
     Returns
     -------
-    actions : jnp.ndarray
+    actions : chex.Array
         Sampled actions from action distributions.
-    log_action_probs : jnp.ndarray
+    log_action_probs : chex.Array
         Logs of action probabilities for sampled actions.
-    entropy : jnp.ndarray
+    entropy : chex.Array
         Entropies of action distributions.
     """
     # Directly use logits to sample actions
@@ -226,28 +224,27 @@ def sample_actions(
     return actions, selected_log_action_probs, entropy
 
 
-@jax.jit
 def give_actions(
-    logits: jnp.ndarray,
-    actions: np.ndarray,
-):
+    logits: chex.Array,
+    actions: chex.Array,
+) -> Tuple[chex.Array, chex.Array, chex.Array]:
     """
-    Calculates probabilities given actions.
+    Calculates probabilities based on given actions.
 
     Parameters
     ----------
-    logits : jnp.ndarray
+    logits : chex.Array
         Action logits output from actor network.
-    actions : np.ndarray
+    actions : chex.Array
         Given input actions to use instead of sampling
 
     Returns
     -------
-    actions : np.ndarray
+    actions : chex.Array
         Return input given actions.
-    log_action_probs : jnp.ndarray
+    log_action_probs : chex.Array
         Logs of action probabilities for given actions.
-    entropy : jnp.ndarray
+    entropy : chex.Array
         Entropies of action distributions.
     """
     # Calculate action probabilities for return or other uses
@@ -265,27 +262,592 @@ def give_actions(
     return actions, selected_log_action_probs, entropy
 
 
-@flax.struct.dataclass
-class Storage:
-    """Stores a batch of data."""
+class Transition(NamedTuple):
+    """Stores a transition of data."""
 
-    obs: jnp.array
-    actions: jnp.array
-    logprobs: jnp.array
-    rewards: jnp.array
-    terminateds: jnp.array
-    values: jnp.array
-    advantages: jnp.array
-    returns: jnp.array
+    obs: chex.Array
+    action: chex.Array
+    reward: chex.Array
+    done: chex.Array
+    log_prob: chex.Array
+    value: chex.Array
+    info: chex.Array
 
 
-if __name__ == "__main__":
-    args = tyro.cli(Args)
+def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
+    """Initializes training.
 
+    Parameters
+    ----------
+    args : Args
+        Parameters used for initializing training function.
+
+    Returns
+    -------
+    Callable[[chex.PRNGKey], dict]
+        Train function.
+    """
     # Initialize batch size, minibatch size, and number of training iterations
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+
+    # Set up environment
+    env, env_params = make_env(args.env_id)
+
+    # Set up learning rate scheduler
+    def linear_schedule(iteration: chex.Array) -> chex.Array:
+        """Linear scheduling function for learning rate.
+
+        Parameters
+        ----------
+        iteration : chex.Array
+            Training iteration.
+
+        Returns
+        -------
+        chex.Array
+            Annealed learning rate.
+        """
+        # anneal learning rate linearly after one training iteration which contains
+        # (args.num_minibatches * args.update_epochs) gradient updates
+        frac = (
+            1.0
+            - (iteration // (args.num_minibatches * args.update_epochs))
+            / args.num_iterations
+        )
+        return args.learning_rate * frac
+
+    # Set up training function
+    def train(key: chex.PRNGKey) -> dict:
+        """Performs PPO training.
+
+        Parameters
+        ----------
+        key : chex.PRNGKey
+            RNG key.
+
+        Returns
+        -------
+        dict
+            Metrics from the end of training.
+        """
+        # Initialize critic
+        init_obs = jnp.zeros(env.observation_space(env_params).shape)
+        vf = Critic()
+        key, critic_key = jax.random.split(key)
+        vf_state = TrainState.create(
+            apply_fn=vf.apply,
+            params=vf.init(critic_key, init_obs),
+            tx=optax.chain(
+                optax.clip_by_global_norm(args.max_grad_norm),
+                optax.inject_hyperparams(optax.adam)(
+                    learning_rate=(
+                        linear_schedule if args.anneal_lr else args.learning_rate
+                    ),
+                    eps=1e-5,
+                ),
+            ),
+        )
+        # Initialize actor
+        actor = Actor(action_dim=env.action_space(env_params).n)
+        key, actor_key = jax.random.split(key)
+        actor_state = TrainState.create(
+            apply_fn=actor.apply,
+            params=actor.init(actor_key, init_obs),
+            tx=optax.chain(
+                optax.clip_by_global_norm(args.max_grad_norm),
+                optax.inject_hyperparams(optax.adam)(
+                    learning_rate=(
+                        linear_schedule if args.anneal_lr else args.learning_rate
+                    ),
+                    eps=1e-5,
+                ),
+            ),
+        )
+
+        # Initialize environment
+        key, env_key = jax.random.split(key)
+        env_reset_key = jax.random.split(env_key, args.num_envs)
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(
+            env_reset_key, env_params
+        )  # Vectorizes reset function
+
+        # Step function representing a training iteration
+        def _update_step(
+            runner_state: Tuple[
+                TrainState,
+                TrainState,
+                dict,
+                environment.EnvState,
+                chex.Array,
+                chex.PRNGKey,
+            ],
+            unused: Any,
+        ) -> Tuple[
+            Tuple[
+                TrainState,
+                TrainState,
+                dict,
+                environment.EnvState,
+                chex.Array,
+                chex.PRNGKey,
+            ],
+            dict,
+        ]:
+            """Training iteration of PPO that processes a single batch of data.
+
+            Parameters
+            ----------
+            runner_state : Tuple[TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.PRNGKey]
+                Input training state carried over from previous iteration of training.
+            unused : Any
+                Unused input value.
+
+            Returns
+            -------
+            Tuple[Tuple[TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.PRNGKey], dict]
+                Updated training state to pass to next iteration of training.
+            """
+            actor_state, vf_state, time_state, env_state, last_obs, key = runner_state
+
+            # Step function used to collect data from the environment
+            def _env_step(
+                step_state: Tuple[
+                    TrainState,
+                    TrainState,
+                    chex.Array,
+                    environment.EnvState,
+                    chex.Array,
+                    chex.PRNGKey,
+                ],
+                unused: Any,
+            ) -> Tuple[
+                Tuple[
+                    TrainState,
+                    TrainState,
+                    chex.Array,
+                    environment.EnvState,
+                    chex.Array,
+                    chex.PRNGKey,
+                ],
+                Transition,
+            ]:
+                """Collect a single transition from the environment, used to generate batches of environment data.
+
+                Parameters
+                ----------
+                step_state : Tuple[TrainState, TrainState, chex.Array, environment.EnvState, chex.Array, chex.PRNGKey]
+                    Step state passed from one environment step to the next.
+                unused : Any
+                    Unused input value.
+
+                Returns
+                -------
+                Tuple[Tuple[TrainState, TrainState, chex.Array, environment.EnvState, chex.Array, chex.PRNGKey], Transition]
+                    Updated step state to pass to the next step of the environment.
+                """
+                actor_state, vf_state, timestep, env_state, last_obs, key = step_state
+
+                # Sample actions from actor
+                key, sampling_key = jax.random.split(key)
+                logits = actor.apply(actor_state.params, last_obs)
+                action, log_prob, _ = sample_actions(logits, sampling_key)
+
+                # Get state-values from critic
+                value = vf.apply(vf_state.params, last_obs).squeeze()
+
+                # Step environments
+                key, env_key = jax.random.split(key)
+                env_step_key = jax.random.split(env_key, args.num_envs)
+                obsv, env_state, reward, done, info = (
+                    jax.vmap(  # Vectorize step function
+                        env.step, in_axes=(0, 0, 0, None)
+                    )(env_step_key, env_state, action, env_params)
+                )
+
+                # Store transition
+                transition = Transition(
+                    last_obs, action, reward, done, log_prob, value, info
+                )
+
+                # Update carry needed for next step
+                step_state = (
+                    actor_state,
+                    vf_state,
+                    timestep + 1,
+                    env_state,
+                    obsv,
+                    key,
+                )
+                return step_state, transition
+
+            # Collect a batch of trajectories
+            step_state = (
+                actor_state,
+                vf_state,
+                time_state["timesteps"],
+                env_state,
+                last_obs,
+                key,
+            )
+            step_state, traj_batch = jax.lax.scan(
+                _env_step, step_state, None, args.num_steps
+            )
+            actor_state, vf_state, timestep, env_state, last_obs, key = step_state
+
+            # Calculate advantages with Generalized Advantage Estimation (GAE)
+            last_value = vf.apply(vf_state.params, last_obs).squeeze()
+
+            def _calculate_gae(
+                traj_batch: Transition, last_value: chex.Array
+            ) -> Tuple[chex.Array, chex.Array]:
+                """Calculates GAE with a batch of trajectory data.
+
+                Parameters
+                ----------
+                traj_batch : Transition
+                    Batch of trajectories.
+                last_value : chex.Array
+                    State-value for last observation from batch collection rollouts.
+
+                Returns
+                -------
+                Tuple[chex.Array, chex.Array]
+                    Advantages and target values.
+                """
+
+                def _get_advantages(
+                    gae_and_next_value: Tuple[chex.Array, chex.Array],
+                    transition: Transition,
+                ) -> Tuple[Tuple[chex.Array, chex.Array], chex.Array]:
+                    """Calculates a single backward step of GAE.
+
+                    Parameters
+                    ----------
+                    gae_and_next_value : Tuple[chex.Array, chex.Array]
+                        Advantage and value from previous step.
+                    transition : Transition
+                        Transition data corresponding to this step.
+
+                    Returns
+                    -------
+                    Tuple[Tuple[chex.Array, chex.Array], chex.Array]
+                        Updated advantage and value to pass to next step.
+                    """
+                    gae, next_value = gae_and_next_value
+                    done, value, reward = (
+                        transition.done,
+                        transition.value,
+                        transition.reward,
+                    )
+                    delta = reward + args.gamma * next_value * (1 - done) - value
+                    gae = delta + args.gamma * args.gae_lambda * (1 - done) * gae
+                    return (gae, value), gae
+
+                _, advantages = jax.lax.scan(
+                    _get_advantages,
+                    (jnp.zeros_like(last_value), last_value),
+                    traj_batch,
+                    reverse=True,
+                    unroll=16,
+                )
+                return advantages, advantages + traj_batch.value
+
+            advantages, targets = _calculate_gae(traj_batch, last_value)
+
+            # Update actor and critic networks over multiple epochs
+            def _update_epoch(
+                update_state: Tuple[
+                    TrainState,
+                    TrainState,
+                    Transition,
+                    chex.Array,
+                    chex.Array,
+                    chex.PRNGKey,
+                ],
+                unused: Any,
+            ) -> Tuple[
+                Tuple[
+                    TrainState,
+                    TrainState,
+                    Transition,
+                    chex.Array,
+                    chex.Array,
+                    chex.PRNGKey,
+                ],
+                Tuple[chex.Array, chex.Array, chex.Array, chex.Array],
+            ]:
+                """Training epoch update.
+
+                Parameters
+                ----------
+                update_state : Tuple[TrainState, TrainState, Transition, chex.Array, chex.Array, chex.PRNGKey]
+                    Training state for performing update.
+                unused : Any
+                    Unused input parameter for lax.scan.
+
+                Returns
+                -------
+                Tuple[Tuple[TrainState, TrainState, Transition, chex.Array, chex.Array, chex.PRNGKey], Tuple[chex.Array, chex.Array, chex.Array, chex.Array]]
+                    Updated training state and losses.
+                """
+
+                # Update actor and critic networks from a single minibatch
+                def _update_minibatch(
+                    train_state: Tuple[TrainState, TrainState],
+                    batch_info: Tuple[Transition, chex.Array, chex.Array],
+                ) -> Tuple[
+                    Tuple[TrainState, TrainState],
+                    Tuple[chex.Array, chex.Array, chex.Array, chex.Array],
+                ]:
+                    """Performs a minibatch update.
+
+                    Parameters
+                    ----------
+                    train_state : Tuple[TrainState, TrainState]
+                        Training state.
+                    batch_info : Tuple[Transition, chex.Array, chex.Array]
+                        Batch data used for updates.
+
+                    Returns
+                    -------
+                    Tuple[Tuple[TrainState, TrainState], Tuple[chex.Array, chex.Array, chex.Array, chex.Array]]
+                        Updated training state.
+                    """
+                    actor_state, vf_state = train_state
+                    traj_batch, advantages, targets = batch_info
+
+                    # Calculate actor loss
+                    def _actor_loss(
+                        actor_params: dict, traj_batch: Transition, gae: chex.Array
+                    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+                        """Loss function for the actor network.
+
+                        Parameters
+                        ----------
+                        actor_params : dict
+                            Params for the actor network.
+                        traj_batch : Transition
+                            Batch of trajectory data.
+                        gae : chex.Array
+                            GAE advantages.
+
+                        Returns
+                        -------
+                        Tuple[chex.Array, chex.Array, chex.Array]
+                            Losses associated with actor.
+                        """
+                        # Calculate new log probabilities and entropies
+                        logits = actor.apply(actor_params, traj_batch.obs)
+                        _, log_prob, entropy = give_actions(logits, traj_batch.action)
+
+                        # Normalize advantages, if specified
+                        norm_gae = (
+                            (gae - gae.mean()) / (gae.std() + 1e-8)
+                            if args.norm_adv
+                            else gae
+                        )
+
+                        # Calculate policy loss
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        pg_loss1 = -norm_gae * ratio
+                        pg_loss2 = -norm_gae * jnp.clip(
+                            ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                        )
+                        pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
+
+                        # Calculate entropy loss
+                        entropy_loss = entropy.mean()
+
+                        # Calculate total actor loss
+                        actor_loss = pg_loss - args.ent_coef * entropy_loss
+
+                        return actor_loss, (pg_loss, entropy_loss)
+
+                    # Calculate critic loss
+                    def _critic_loss(
+                        critic_params: dict, traj_batch: Transition, targets: chex.Array
+                    ) -> Tuple[chex.Array, Tuple[chex.Array]]:
+                        """Loss function for critic.
+
+                        Parameters
+                        ----------
+                        critic_params : dict
+                            Parameters of the critic network.
+                        traj_batch : Transition
+                            Batch of trajectory data.
+                        targets : chex.Array
+                            Target values calculated from GAE.
+
+                        Returns
+                        -------
+                        Tuple[chex.Array, Tuple[chex.Array]]
+                            Loss values associated with critic.
+                        """
+                        # Get state-values from critic
+                        value = vf.apply(critic_params, traj_batch.obs).squeeze()
+
+                        # Calculate value loss
+                        if args.clip_vloss:
+                            value_pred_clipped = traj_batch.value + (
+                                value - traj_batch.value
+                            ).clip(-args.clip_coef, args.clip_coef)
+                            value_losses_clipped = jnp.square(
+                                value_pred_clipped - targets
+                            )
+                            value_losses_unclipped = jnp.square(value - targets)
+                            value_loss = (
+                                0.5
+                                * jnp.maximum(
+                                    value_losses_unclipped, value_losses_clipped
+                                ).mean()
+                            )
+                        else:
+                            value_loss = 0.5 * jnp.square(value - targets).mean()
+
+                        # Calculate total critic loss
+                        critic_loss = value_loss * args.vf_coef
+
+                        return critic_loss, (value_loss)
+
+                    # Calculate actor network gradients with respect to loss and update it
+                    actor_grad_fn = jax.value_and_grad(_actor_loss, has_aux=True)
+                    (actor_loss, (pg_loss, entropy_loss)), grads = actor_grad_fn(
+                        actor_state.params, traj_batch, advantages
+                    )
+                    actor_state = actor_state.apply_gradients(grads=grads)
+
+                    # Calculate critic network gradients with respect to loss and update it
+                    critic_grad_fn = jax.value_and_grad(_critic_loss, has_aux=True)
+                    (critic_loss, (value_loss)), grads = critic_grad_fn(
+                        vf_state.params, traj_batch, targets
+                    )
+                    vf_state = vf_state.apply_gradients(grads=grads)
+
+                    return (actor_state, vf_state), (
+                        actor_loss + critic_loss,
+                        pg_loss,
+                        entropy_loss,
+                        value_loss,
+                    )
+
+                # Carry data from previous epoch of training
+                actor_state, vf_state, traj_batch, advantages, targets, key = (
+                    update_state
+                )
+
+                # Create minibatches from batch for current epoch of training
+                key, batch_key = jax.random.split(key)
+                permutation = jax.random.permutation(batch_key, args.batch_size)
+                batch = (traj_batch, advantages, targets)
+                batch = jax.tree_map(
+                    lambda x: x.reshape((args.batch_size,) + x.shape[2:]), batch
+                )
+                shuffled_batch = jax.tree_map(
+                    lambda x: jnp.take(x, permutation, axis=0), batch
+                )
+                minibatches = jax.tree_map(
+                    lambda x: jnp.reshape(
+                        x, [args.num_minibatches, -1] + list(x.shape[1:])
+                    ),
+                    shuffled_batch,
+                )
+
+                # Train on all the minibatches
+                train_state = (actor_state, vf_state)
+                train_state, (total_loss, pg_loss, entropy_loss, value_loss) = (
+                    jax.lax.scan(_update_minibatch, train_state, minibatches)
+                )
+                update_state = (
+                    train_state[0],
+                    train_state[1],
+                    traj_batch,
+                    advantages,
+                    targets,
+                    key,
+                )
+                return update_state, (total_loss, pg_loss, entropy_loss, value_loss)
+
+            # Update time state
+            time_state["timesteps"] = timestep
+            time_state["updates"] = time_state["updates"] + 1
+
+            # Update training state
+            update_state = (actor_state, vf_state, traj_batch, advantages, targets, key)
+            update_state, loss_info = jax.lax.scan(
+                _update_epoch, update_state, None, args.update_epochs
+            )
+            actor_state = update_state[0]
+            vf_state = update_state[1]
+            key = update_state[-1]
+
+            # Update the returning metrics
+            metric = traj_batch.info
+            metric["learning_rate"] = actor_state.opt_state[1].hyperparams[
+                "learning_rate"
+            ]
+            metric["value_loss"] = loss_info[3].mean()
+            metric["policy_loss"] = loss_info[1].mean()
+            metric["entropy"] = loss_info[2].mean()
+            metric["total_loss"] = loss_info[0].mean()
+            metric["timesteps"] = time_state["timesteps"] * args.num_envs
+            metric["updates"] = time_state["updates"]
+
+            def callback(info: dict) -> None:
+                """Callback for logging data during training.
+
+                Parameters
+                ----------
+                info : dict
+                    Logging data.
+                """
+                return_values = info["returned_episode_returns"][
+                    info["returned_episode"]
+                ]
+                length_values = info["returned_episode_lengths"][
+                    info["returned_episode"]
+                ]
+                timesteps = info["timestep"][info["returned_episode"]] * args.num_envs
+                for t in range(len(timesteps)):
+                    print(
+                        f"global step={timesteps[t]}, episodic return={return_values[t]}, episodic length={length_values[t]}"
+                    )
+
+                if args.track:
+                    data_log = {
+                        "misc/learning_rate": info["learning_rate"].item(),
+                        "losses/value_loss": info["value_loss"].item(),
+                        "losses/policy_loss": info["policy_loss"].item(),
+                        "losses/entropy": info["entropy"].item(),
+                        "losses/total_loss": info["total_loss"].item(),
+                        "misc/global_step": info["timesteps"],
+                        "misc/updates": info["updates"],
+                    }
+                    if return_values.size > 0:
+                        data_log["misc/episodic_return"] = return_values.mean().item()
+                        data_log["misc/episodic_length"] = length_values.mean().item()
+                    wandb.log(data_log, step=info["timesteps"])
+
+            jax.debug.callback(callback, metric)
+
+            runner_state = (actor_state, vf_state, time_state, env_state, last_obs, key)
+            return runner_state, metric
+
+        # Run training
+        key, train_key = jax.random.split(key)
+        time_state = {"timesteps": jnp.array(0), "updates": jnp.array(0)}
+        runner_state = (actor_state, vf_state, time_state, env_state, obsv, train_key)
+        runner_state, metric = jax.lax.scan(
+            _update_step, runner_state, None, args.num_iterations
+        )
+        return {"runner_state": runner_state, "metrics": metric}
+
+    return train
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
 
     # Set up experiment identification
     run_name = f"{args.exp_name}"
@@ -320,551 +882,14 @@ if __name__ == "__main__":
                 name=run_name,
                 save_code=True,
                 settings=wandb.Settings(code_dir="."),
-                mode="online",
+                mode="offline",
             )
 
     # Seeding
-    os.environ["PYTHONHASHSEED"] = str(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
 
-    # Initialize environment
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i) for i in range(args.num_envs)]
-    )
-
-    # Set up learning rate scheduler
-    def linear_schedule(iteration):
-        # anneal learning rate linearly after one training iteration which contains
-        # (args.num_minibatches * args.update_epochs) gradient updates
-        frac = (
-            1.0
-            - (iteration // (args.num_minibatches * args.update_epochs))
-            / args.num_iterations
-        )
-        return args.learning_rate * frac
-
-    # Initialize models
-    obs, _ = envs.reset(seed=args.seed)
-    vf = Critic()
-    key, critic_key = jax.random.split(key, 2)
-    vf_state = TrainState.create(
-        apply_fn=vf.apply,
-        params=vf.init(critic_key, obs),
-        tx=optax.chain(
-            optax.clip_by_global_norm(args.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(
-                learning_rate=linear_schedule if args.anneal_lr else args.learning_rate,
-                eps=1e-5,
-            ),
-        ),
-    )
-    vf.apply = jax.jit(vf.apply)
-
-    actor = Actor(action_dim=envs.single_action_space.n)
-    key, actor_key = jax.random.split(key, 2)
-    actor_state = TrainState.create(
-        apply_fn=actor.apply,
-        params=actor.init(actor_key, obs),
-        tx=optax.chain(
-            optax.clip_by_global_norm(args.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(
-                learning_rate=linear_schedule if args.anneal_lr else args.learning_rate,
-                eps=1e-5,
-            ),
-        ),
-    )
-    actor.apply = jax.jit(actor.apply)
-
-    def compute_gae_once(
-        carry: jnp.ndarray,
-        input: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
-        gamma: float,
-        gae_lambda: float,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Calculates a single iteration of GAE.
-
-        Parameters
-        ----------
-        carry : jnp.ndarray
-            Carry from the previous iteration.
-        input : Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
-            Current input of this iteration.
-        gamma : float
-            Discount factor gamma.
-        gae_lambda : float
-            GAE bias/variance tradeoff value lambda.
-
-        Returns
-        -------
-        Tuple[jnp.ndarray, jnp.ndarray]
-            Updated carry and current result.
-        """
-        advantages = carry
-        nextdone, nextvalues, curvalues, reward = input
-        nextnonterminal = 1.0 - nextdone
-
-        delta = reward + gamma * nextvalues * nextnonterminal - curvalues
-        advantages = delta + gamma * gae_lambda * nextnonterminal * advantages
-        return advantages, advantages
-
-    # Initialize function for computing single iteration of GAE
-    compute_gae_once = partial(
-        compute_gae_once, gamma=args.gamma, gae_lambda=args.gae_lambda
-    )
-
-    @jax.jit
-    def compute_gae(
-        vf_state: TrainState,
-        next_obs: np.ndarray,
-        next_terminated: np.ndarray,
-        storage: Storage,
-    ) -> Storage:
-        """Calculated Generalized Advantage Estimation (GAE).
-
-        Parameters
-        ----------
-        vf_state : TrainState
-            State of the critic network.
-        next_obs : np.ndarray
-            Next observations.
-        next_terminated : np.ndarray
-            Next terminateds.
-        storage : Storage
-            Storage containing batch of data.
-
-        Returns
-        -------
-        Storage
-            Updated batch with added advantage and return data.
-        """
-        # Calculate next value
-        next_value = vf.apply(vf_state.params, next_obs).squeeze()
-
-        # Calculate advantages and returns using GAE
-        advantages = jnp.zeros((args.num_envs,))
-        terminateds = jnp.concatenate(
-            [storage.terminateds, next_terminated[None, :]], axis=0
-        )
-        values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
-        _, advantages = jax.lax.scan(
-            compute_gae_once,
-            advantages,
-            (terminateds[1:], values[1:], values[:-1], storage.rewards),
-            reverse=True,
-        )
-        storage = storage.replace(
-            advantages=advantages,
-            returns=advantages + storage.values,
-        )
-        return storage
-
-    # Define update functions here to limit the need for static argname
-    def update_critic(
-        critic_state: TrainState,
-        observations: jnp.ndarray,
-        returns: jnp.ndarray,
-    ) -> Tuple[TrainState, jnp.ndarray, jnp.ndarray]:
-        """Updates the critic.
-
-        Parameters
-        ----------
-        critic_state : TrainState
-            State of the critic network.
-        observations : jnp.ndarray
-            Observations.
-        returns : jnp.ndarray
-            Returns.
-
-        Returns
-        -------
-        Tuple[TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
-            Results from updating the critic.
-        """
-
-        def critic_loss(critic_params: dict) -> Tuple[jnp.ndarray, jnp.ndarray]:
-            """
-            Computes the critic loss for updating the critic.
-
-            Parameters:
-            -----------
-            critic_params : dict
-                The parameters of the critic model.
-
-            Returns:
-            --------
-            Tuple[jnp.ndarray, jnp.ndarray]
-                A tuple containing the various loss values.
-            """
-            # Get state-values from critic
-            new_values = vf.apply(critic_params, observations)
-            new_values = new_values.squeeze()
-
-            # Calculate value loss
-            v_loss = 0.5 * ((new_values - returns) ** 2).mean()
-
-            # Calculate total critic loss
-            critic_loss = v_loss * args.vf_coef
-
-            return critic_loss, v_loss
-
-        # Calculate values and gradients of loss with respect to critic network params
-        (critic_loss_value, v_loss_value), grads = jax.value_and_grad(
-            critic_loss, has_aux=True
-        )(critic_state.params)
-
-        # Apply gradients to actor network
-        critic_state = critic_state.apply_gradients(grads=grads)
-
-        return critic_state, (critic_loss_value, v_loss_value)
-
-    def update_actor(
-        actor_state: TrainState,
-        observations: jnp.ndarray,
-        actions: jnp.ndarray,
-        logprobs: jnp.ndarray,
-        advantages: jnp.ndarray,
-    ) -> Tuple[TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Updates the actor.
-
-        Parameters
-        ----------
-        actor_state : TrainState
-            State of the actor network.
-        observations : jnp.ndarray
-            Observations.
-        actions : jnp.ndarray
-            Actions.
-        logprobs : jnp.ndarray
-            Log probabilities of actions.
-        advantages : jnp.ndarray
-            Advantages.
-
-        Returns
-        -------
-        Tuple[TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
-            Results from updating the actor.
-        """
-
-        def actor_loss(
-            actor_params: dict,
-        ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-            """
-            Computes the actor loss for updating the actor.
-
-            Parameters:
-            -----------
-            actor_params : dict
-                The parameters of the actor model.
-
-            Returns:
-            --------
-            Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
-                A tuple containing the actor loss and the entropy.
-            """
-
-            # Calculate new log probabilities and entropies
-            logits = actor.apply(actor_params, observations)
-            _, newlogprobs, entropies = give_actions(logits, actions)
-
-            # Calculate approximate KL divergence between old vs. new distribution
-            logratio = newlogprobs - logprobs
-            ratio = jnp.exp(logratio)
-            approx_kl = (
-                (ratio - 1) - logratio
-            ).mean()  # From: http://joschu.net/blog/kl-approx.html
-
-            # Normalize advantages, if specified
-            norm_advantages = (
-                (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                if args.norm_adv
-                else advantages
-            )
-
-            # Calculate policy loss
-            pg_loss1 = -norm_advantages * ratio
-            pg_loss2 = -norm_advantages * jnp.clip(
-                ratio, 1 - args.clip_coef, 1 + args.clip_coef
-            )
-            pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
-
-            # Calculate entropy loss
-            entropy_loss = entropies.mean()
-
-            # Calculate total actor loss
-            actor_loss = pg_loss - args.ent_coef * entropy_loss
-
-            return actor_loss, (pg_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
-
-        # Calculate values and gradients of loss with respect to actor network params
-        (actor_loss_value, (pg_loss_value, entropy_loss_value, approx_kl)), grads = (
-            jax.value_and_grad(actor_loss, has_aux=True)(actor_state.params)
-        )
-
-        # Apply gradients to actor network
-        actor_state = actor_state.apply_gradients(grads=grads)
-
-        return (
-            actor_state,
-            (actor_loss_value, pg_loss_value, entropy_loss_value, approx_kl),
-        )
-
-    @jax.jit
-    def update_ppo(
-        actor_state: TrainState,
-        vf_state: TrainState,
-        storage: Storage,
-        key: jax.Array,
-    ):
-        def update_epoch(
-            carry: Tuple[TrainState, TrainState, jax.Array], unused_input
-        ) -> Tuple[
-            TrainState,
-            TrainState,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jnp.ndarray,
-            jax.Array,
-        ]:
-            """Training epoch that updates the actor and critic networks.
-
-            Parameters
-            ----------
-            carry : Tuple[TrainState, TrainState, jax.Array]
-                Actor and critic train states as well as RNG key.
-            unused_input : Any
-                Unused input, can be of any type.
-
-            Returns
-            -------
-            Tuple[ TrainState, TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jax.Array, ]
-                Updated actor and critic train states as well as loss values.
-            """
-            actor_state, vf_state, key = carry
-            key, minibatch_sampling_key = jax.random.split(key)
-
-            def flatten(x: jnp.ndarray) -> jnp.ndarray:
-                """Flattens batch of data, specifically converts shape
-                (num_steps, num_envs) to (num_steps * num_envs, ).
-
-                Parameters
-                ----------
-                x : jnp.ndarray
-                    Batch of data to be flattened.
-
-                Returns
-                -------
-                jnp.ndarray
-                    Flattened batch of data.
-                """
-                return x.reshape((-1,) + x.shape[2:])
-
-            # taken from: https://github.com/google/brax/blob/main/brax/training/agents/ppo/train.py
-            def convert_data(x: jnp.ndarray) -> jnp.ndarray:
-                """Shuffles a flattened batch of data, then
-                splits it into minibatches.
-
-                Parameters
-                ----------
-                x : jnp.ndarray
-                    Flattened batch of data
-
-                Returns
-                -------
-                jnp.ndarray
-                    Minibatches of data.
-                """
-                x = jax.random.permutation(minibatch_sampling_key, x)
-                x = jnp.reshape(x, (args.num_minibatches, -1) + x.shape[1:])
-                return x
-
-            # Flattens batch
-            flatten_storage = jax.tree_map(flatten, storage)
-
-            # Splits flattened batch into minibatches
-            shuffled_storage = jax.tree_map(convert_data, flatten_storage)
-
-            def update_minibatch(
-                carry: Tuple[TrainState, TrainState], input: Storage
-            ) -> Tuple[
-                Tuple[TrainState, TrainState],
-                Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
-            ]:
-                """Updates the actor and critic using a minibatch of data.
-
-                Parameters
-                ----------
-                carry : Tuple[TrainState, TrainState]
-                    Current train states of actor and critic.
-                input : Storage
-                    Minibatch of data.
-
-                Returns
-                -------
-                Tuple[ Tuple[TrainState, TrainState], Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray], ]
-                    Updated actor and critic states, as well as loss values.
-                """
-                actor_state, vf_state = carry
-
-                # Update actor
-                actor_state, (actor_loss, pg_loss, entropy_loss, approx_kl) = (
-                    update_actor(
-                        actor_state,
-                        input.obs,
-                        input.actions,
-                        input.logprobs,
-                        input.advantages,
-                    )
-                )
-
-                # Update critic
-                vf_state, (critic_loss, v_loss) = update_critic(
-                    vf_state,
-                    input.obs,
-                    input.returns,
-                )
-
-                # Calculate summed loss
-                loss = actor_loss + critic_loss
-                return (actor_state, vf_state), (
-                    loss,
-                    pg_loss,
-                    v_loss,
-                    entropy_loss,
-                    approx_kl,
-                )
-
-            # Update actor and critic networks with minibatches of data
-            (actor_state, vf_state), (
-                loss,
-                pg_loss,
-                v_loss,
-                entropy_loss,
-                approx_kl,
-            ) = jax.lax.scan(
-                update_minibatch, (actor_state, vf_state), shuffled_storage
-            )
-            return (actor_state, vf_state, key), (
-                loss,
-                pg_loss,
-                v_loss,
-                entropy_loss,
-                approx_kl,
-            )
-
-        # Update actor and critic over multiple epochs of training
-        (actor_state, vf_state, key), (
-            loss,
-            pg_loss,
-            v_loss,
-            entropy_loss,
-            approx_kl,
-        ) = jax.lax.scan(
-            update_epoch, (actor_state, vf_state, key), (), length=args.update_epochs
-        )
-        return (
-            actor_state,
-            vf_state,
-            (loss, pg_loss, v_loss, entropy_loss, approx_kl),
-            key,
-        )
-
-    # Initialize storage for batches
-    obs = np.zeros(
-        (args.num_steps, args.num_envs) + envs.single_observation_space.shape,
-        dtype=np.float32,
-    )
-    actions = np.zeros(
-        (args.num_steps, args.num_envs) + envs.single_action_space.shape, dtype=np.int64
-    )
-    logprobs = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
-    rewards = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
-    terminateds = np.zeros((args.num_steps, args.num_envs), dtype=bool)
-    values = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
-
-    # Start time tracking for run
-    start_time = time.time()
-
-    # Start the game
-    global_step = 0
-    next_obs, info = envs.reset(seed=args.seed)
-    next_terminated = np.zeros(args.num_envs, dtype=np.bool_)
-    for iteration in range(1, args.num_iterations + 1):
-        # Store values for data logging for each global step
-        data_log = {}
-
-        # Collect batch of timesteps from multiple environments
-        for step in range(0, args.num_steps):
-            global_step += 1 * args.num_envs
-            obs[step] = next_obs
-            terminateds[step] = next_terminated
-
-            # Sample actions from actor
-            key, sampling_key = jax.random.split(key, 2)  # Split key for RNG
-            logits = actor.apply(actor_state.params, next_obs)
-            action, logprob, _ = sample_actions(logits, sampling_key)
-            actions[step] = action
-            logprobs[step] = logprob
-
-            # Get state-values from critic
-            value = vf.apply(vf_state.params, next_obs)
-            values[step] = value.squeeze()
-
-            # Take step in environments
-            next_obs, reward, terminated, truncated, infos = envs.step(np.array(action))
-            rewards[step] = reward
-            next_terminated = terminated
-
-            # Handle episode end, record rewards for plotting purposes
-            if "final_info" not in infos:
-                continue  # Only print when at least 1 env is done
-            for info in infos["final_info"]:
-                if info is None:
-                    continue  # Skip the envs that are not done
-                print(
-                    f"global_step={global_step}, episodic_return={info['episode']['r']}"
-                )
-                data_log["misc/episodic_return"] = info["episode"]["r"]
-                data_log["misc/episodic_length"] = info["episode"]["l"]
-
-        # Do Generalized Advantaged Estimation (GAE) and calculate advantages and returns
-        storage = Storage(
-            obs=jnp.array(obs),
-            actions=jnp.array(actions),
-            logprobs=jnp.array(logprobs),
-            rewards=jnp.array(rewards),
-            terminateds=jnp.array(terminateds),
-            values=jnp.array(values),
-            returns=jnp.zeros_like(rewards),
-            advantages=jnp.zeros_like(rewards),
-        )
-        storage = compute_gae(vf_state, next_obs, next_terminated, storage)
-
-        # Optimize the actor and critic networks
-        actor_state, vf_state, (loss, pg_loss, v_loss, entropy_loss, approx_kl), key = (
-            update_ppo(actor_state, vf_state, storage, key)
-        )
-
-        if args.track:
-            # Perform logging
-            data_log["misc/learning_rate"] = (
-                actor_state.opt_state[1].hyperparams["learning_rate"].item()
-            )
-            data_log["losses/value_loss"] = v_loss[-1, -1].item()
-            data_log["losses/policy_loss"] = pg_loss[-1, -1].item()
-            data_log["losses/entropy"] = entropy_loss[-1, -1].item()
-            data_log["losses/approx_kl"] = approx_kl[-1, -1].item()
-            data_log["losses/loss"] = loss[-1, -1].item()
-            data_log["misc/steps_per_second"] = int(
-                global_step / (time.time() - start_time)
-            )
-            print("SPS:", int(global_step / (time.time() - start_time)))
-
-            data_log["misc/global_step"] = global_step
-            wandb.log(data_log, step=global_step)
-
-    # Close environment after training
-    envs.close()
+    # Compile training function
+    train_vjit = jax.jit(make_train(args))
+
+    # Run training
+    train_output = jax.block_until_ready(train_vjit(key))
