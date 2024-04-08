@@ -3,3 +3,4 @@ wandb/
 trained_models/
 *.pkl
 .vscode/
+.ruff_cache/

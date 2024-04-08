@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Tuple
 
 import chex
@@ -13,14 +14,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import tyro
+from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from gymnax.environments import environment
+from jax import config  # noqa F401
 
 import wandb
 from wrappers import FlattenObservationWrapper, LogWrapper
 
-# config.update("jax_disable_jit", True)
+# config.update("jax_disable_jit", True)  # Uncomment for debugging
 
 
 @dataclass
@@ -29,61 +33,113 @@ class Args:
 
     # General arguments
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """name of this experiment"""
+    """Name of this experiment."""
     seed: int = 1
-    """seed of the experiment"""
+    """Seed of the experiment."""
 
     # Weights & Biases specific arguments
     track: bool = True
-    """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project: str = "sac_discrete_action"
-    """"wandb project name"""
+    """If toggled, this experiment will be tracked with Weights and Biases."""
+    wandb_project: str = "test2"
+    """"W&B project name."""
     wandb_dir: str = "./"
-    """"wandb project directory"""
+    """"W&B project directory."""
     wandb_entity: str = None
-    """wandb entity (team) name"""
+    """W&B entity (team) name."""
     wandb_group: str = None
-    """wandb group name"""
+    """W&B group name."""
     wandb_job_type: str = None
-    """wandb job_type name, for categorizing runs in a group"""
+    """W&B job type name, for categorizing runs in a group."""
 
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
-    """id of the environment"""
+    """ID of the environment."""
     total_timesteps: int = 100000
-    """total timesteps of the experiments"""
+    """Total timesteps of the experiments."""
     buffer_size: int = 100000
-    """replay memory buffer size"""
+    """Replay buffer size."""
     gamma: float = 0.99
-    """discount factor gamma"""
+    """Discount factor gamma."""
     tau: float = 0.005
-    """target network update rate"""
+    """Target network update rate."""
     batch_size: int = 256
-    """batch size of sample from the reply memory"""
-    learning_starts: int = 1
-    """timestep to start learning"""
+    """Batch size of sample from replay buffer."""
+    learning_starts: int = 5000
+    """Timestep to start learning."""
     policy_lr: float = 3e-4
-    """learning rate of the policy network optimizer"""
-    q_lr: float = 3e-4
-    """learning rate of the Q network network optimizer"""
+    """Learning rate of the policy network optimizer."""
+    q_lr: float = 1e-3
+    """Learning rate of the Q network network optimizer."""
     policy_frequency: int = 2
-    """frequency of training policy (delayed)"""
+    """Frequency of training policy (delayed)."""
     target_network_frequency: int = 1
-    """frequency of updates for the target networks"""
+    """Frequency of updates for the target networks."""
 
     # Checkpointing specific arguments
-    save: bool = False
-    """automatic tuning of the entropy coefficient"""
-    save_checkpoint_dir: str = None
-    """path to directory to save checkpoints in"""
+    save: bool = True
+    """Automatic tuning of the entropy coefficient."""
+    save_checkpoint_dir: str = (
+        "/home/chulabhaya/phd/research/jax-rl-algorithms/checkpoints"
+    )
+    """Path to directory to save checkpoints in."""
     checkpoint_interval: int = 25000
-    """how often to save checkpoints during training (in timesteps)"""
+    """How often to save checkpoints during training (in timesteps)."""
     resume: bool = False
-    """whether to resume training from a checkpoint"""
-    resume_checkpoint_path: str = None
-    """path to checkpoint to resume training from"""
+    """Whether to resume training from a checkpoint."""
+    resume_checkpoint_path: str = (
+        "/home/chulabhaya/phd/research/jax-rl-algorithms/checkpoints/sac_discrete_action_ppjp3swp/50000"
+    )
+    """Path to checkpoint to resume training from."""
     run_id: str = None
-    """wandb unique run id for resuming"""
+    """W&B unique run id for resuming."""
+
+
+def save(
+    run_id: str,
+    checkpoint_dir: str,
+    timestep: int,
+    runner_state: Tuple[
+        TrainState,
+        TrainState,
+        TrainState,
+        dict,
+        environment.EnvState,
+        chex.Array,
+        chex.Array,
+        chex.PRNGKey,
+    ],
+) -> None:
+    """Saves checkpoints.
+
+    Parameters
+    ----------
+    run_id : str
+        Run ID.
+    checkpoint_dir : str
+        Directory to store checkpoints in.
+    timestep : int
+        Timestep of checkpoint.
+    runner_state : Tuple[ TrainState, TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.Array, chex.PRNGKey, ]
+        Training state.
+    """
+    # Set up directory for saving data
+    save_dir = Path(checkpoint_dir) / run_id
+    save_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(
+        save_dir, 0o777
+    )  # Prevent permission issues when writing to this directory after resuming a training job
+
+    # Save data
+    checkpointer = ocp.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(runner_state)
+    checkpoint_path = save_dir / Path(str(timestep))
+    print(f"Saving checkpoint: {checkpoint_path}", flush=True)
+    checkpointer.save(
+        checkpoint_path,
+        runner_state,
+        save_args=save_args,
+        force=True,
+    )
 
 
 def make_env(env_id: str) -> environment.Environment:
@@ -177,9 +233,9 @@ class VectorCritic(nn.Module):
         # Similar to https://github.com/tinkoff-ai/CORL for PyTorch
         vmap_critic = nn.vmap(
             Critic,
-            variable_axes={"params": 0},  # parameters not shared between the critics
-            split_rngs={"params": True},  # different initializations
-            in_axes=None,  # doesn't batch inputs to network automatically
+            variable_axes={"params": 0},  # Parameters not shared between the critics
+            split_rngs={"params": True},  # Different initializations
+            in_axes=None,  # Doesn't batch inputs to network automatically
             out_axes=0,
             axis_size=self.n_critics,
         )
@@ -286,7 +342,7 @@ def sample_actions(
 
 
 def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
-    """Create training function.
+    """Initializes training.
 
     Parameters
     ----------
@@ -298,15 +354,12 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
     Callable[[chex.PRNGKey], dict]
         Train function.
     """
-    # Initialize number of total training timesteps
-    args.training_timesteps = args.total_timesteps - args.learning_starts
-
     # Set up environment
     env, env_params = make_env(args.env_id)
 
     # Training function
     def train(key: chex.PRNGKey) -> dict:
-        """SAC training function.
+        """Performs training.
 
         Parameters
         ----------
@@ -318,14 +371,19 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
         dict
             Metrics from the end of training.
         """
+        # Get sample obs and action for initializing models and replay buffer
+        key, sample_obs_key = jax.random.split(key)
+        key, sample_action_key = jax.random.split(key)
+        sample_obs = env.observation_space(env_params).sample(sample_obs_key)
+        sample_action = env.action_space(env_params).sample(sample_action_key)
+
         # Initialize critic
-        init_obs = jnp.zeros(env.observation_space(env_params).shape)
         qf = VectorCritic(action_dim=env.action_space(env_params).n)
         key, critic_key = jax.random.split(key)
         qf_state = CriticTrainState.create(
             apply_fn=qf.apply,
-            params=qf.init({"params": critic_key}, init_obs),
-            target_params=qf.init({"params": critic_key}, init_obs),
+            params=qf.init({"params": critic_key}, sample_obs),
+            target_params=qf.init({"params": critic_key}, sample_obs),
             tx=optax.adam(learning_rate=args.q_lr),
         )
         # Initialize actor
@@ -333,7 +391,7 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
         key, actor_key = jax.random.split(key)
         actor_state = TrainState.create(
             apply_fn=actor.apply,
-            params=actor.init(actor_key, init_obs),
+            params=actor.init(actor_key, sample_obs),
             tx=optax.adam(learning_rate=args.policy_lr),
         )
         # Initialize temperature model
@@ -353,14 +411,13 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
         replay_buffer = fbx.make_flat_buffer(
             args.buffer_size, args.learning_starts, args.batch_size, False, None
         )
-        # TODO: Generalize this
         buffer_state = replay_buffer.init(
             {
-                "observations": jnp.array([5.0, 4.0, 2.0, 1.0]),
-                "actions": jnp.array(0),
-                "rewards": jnp.array(1.0),
-                "next_observations": jnp.array([5.0, 4.0, 2.0, 1.0]),
-                "dones": jnp.array(True),
+                "observations": sample_obs,
+                "actions": sample_action,
+                "rewards": jnp.array(0.0),
+                "next_observations": sample_obs,
+                "dones": jnp.array(False),
             }
         )
 
@@ -369,6 +426,7 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
         obs, env_state = env.reset(env_reset_key, env_params)
 
         # Warm up replay buffer with random data
+        @jax.jit
         def _warmup_step(
             warmup_state: Tuple[
                 dict,
@@ -385,7 +443,7 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
                 chex.PRNGKey,
             ],
         ]:
-            """Warm up step used to initialize replay buffer with random data.
+            """Warm-up step used to initialize replay buffer with random data.
 
             Parameters
             ----------
@@ -445,6 +503,7 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
         buffer_state, env_state, obs, key = warmup_state
 
         # Step function representing a training iteration
+        @jax.jit
         def _update_step(
             runner_state: Tuple[
                 TrainState,
@@ -862,6 +921,7 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
                         actor_and_temperature_update_state,
                         None,
                         args.policy_frequency,
+                        unroll=True,
                     )
                 )
                 return (
@@ -988,54 +1048,7 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
                 qf_state,
             )
 
-            # Update the returning metrics
-            metric = info
-            metric["qf_values"] = qf_values
-            metric["qf_loss"] = qf_loss_value
-            metric["actor_loss"] = actor_and_temperature_loss_info[0].mean()
-            metric["actor_entropy"] = actor_and_temperature_loss_info[1].mean()
-            metric["temperature"] = temperature
-            metric["temperature_loss"] = actor_and_temperature_loss_info[2].mean()
-
-            def callback(info: dict) -> None:
-                """Callback for logging data during training.
-
-                Parameters
-                ----------
-                info : dict
-                    Logging data.
-                """
-                return_value = info["returned_episode_returns"]
-                length_value = info["returned_episode_lengths"]
-                done = info["returned_episode"]
-                timestep = info["timestep"]
-                if done:
-                    print(
-                        f"global step={timestep}, episodic return={return_value}, episodic length={length_value}"
-                    )
-
-                if args.track:
-                    data_log = {"misc/global_step": timestep}
-                    if done:
-                        data_log["misc/episodic_return"] = return_value.item()
-                        data_log["misc/episodic_length"] = length_value.item()
-                    if timestep % 100 == 0:
-                        data_log = {
-                            "losses/qf_values": info["qf_values"].item(),
-                            "losses/qf_loss": info["qf_loss"].item(),
-                        }
-                        if timestep % args.policy_frequency == 0:
-                            data_log["losses/actor_loss"] = info["actor_loss"].item()
-                            data_log["losses/actor_entropy"] = info[
-                                "actor_entropy"
-                            ].item()
-                            data_log["losses/temperature"] = info["temperature"].item()
-                            data_log["losses/temperature_loss"] = info[
-                                "temperature_loss"
-                            ].item()
-                    wandb.log(data_log, step=timestep)
-
-            jax.debug.callback(callback, metric)
+            # Update overall runner state
             runner_state = (
                 actor_state,
                 qf_state,
@@ -1046,6 +1059,176 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
                 obs,
                 key,
             )
+
+            # Update metrics for logging
+            metric = {
+                "step_info": info,
+                "qf_loss": qf_values,
+                "qf_values": qf_values,
+                "policy_loss": actor_and_temperature_loss_info[0].mean(),
+                "entropy": actor_and_temperature_loss_info[1].mean(),
+                "temperature": temperature,
+                "temperature_loss": actor_and_temperature_loss_info[2].mean(),
+            }
+
+            def _logging_callback(
+                metric: dict,
+            ) -> None:
+                """Callback for logging data during training.
+
+                Parameters
+                ----------
+                metric : dict
+                    Training metrics.
+                """
+                return_value = metric["step_info"]["returned_episode_returns"]
+                length_value = metric["step_info"]["returned_episode_lengths"]
+                done = metric["step_info"]["returned_episode"]
+                timestep = metric["step_info"]["timestep"]
+                if done:
+                    print(
+                        f"global step={timestep}, episodic return={return_value}, episodic length={length_value}"
+                    )
+
+                # If logging to wandb
+                if args.track:
+                    data_log = {"misc/global_step": timestep}
+                    if done:
+                        data_log["misc/episodic_return"] = return_value.item()
+                        data_log["misc/episodic_length"] = length_value.item()
+                    if timestep % 100 == 0:
+                        data_log = {
+                            "losses/qf_values": metric["qf_values"].item(),
+                            "losses/qf_loss": metric["qf_loss"].item(),
+                        }
+                        if timestep % args.policy_frequency == 0:
+                            data_log["losses/policy_loss"] = metric[
+                                "policy_loss"
+                            ].item()
+                            data_log["losses/entropy"] = metric["entropy"].item()
+                            data_log["losses/temperature"] = metric[
+                                "temperature"
+                            ].item()
+                            data_log["losses/temperature_loss"] = metric[
+                                "temperature_loss"
+                            ].item()
+                    wandb.log(data_log, step=timestep)
+
+            # Perform callback for logging
+            jax.debug.callback(_logging_callback, metric)
+
+            # Perform checkpointing, if necessary
+            if args.save:
+
+                def _checkpointing_callback(
+                    timestep: int,
+                    runner_state: Tuple[
+                        TrainState,
+                        TrainState,
+                        TrainState,
+                        dict,
+                        environment.EnvState,
+                        chex.Array,
+                        chex.Array,
+                        chex.PRNGKey,
+                    ],
+                ) -> None:
+                    """Callback for saving checkpoints during training.
+
+                    Parameters
+                    ----------
+                    timestep : int
+                        Timestep.
+                    runner_state : Tuple[ TrainState, TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.Array, chex.PRNGKey, ]
+                        Training state.
+                    """
+                    save(args.run_id, args.save_checkpoint_dir, timestep, runner_state)
+
+                def _checkpoint(
+                    timestep: int,
+                    runner_state: Tuple[
+                        TrainState,
+                        TrainState,
+                        TrainState,
+                        dict,
+                        environment.EnvState,
+                        chex.Array,
+                        chex.Array,
+                        chex.PRNGKey,
+                    ],
+                ) -> Tuple[
+                    TrainState,
+                    TrainState,
+                    TrainState,
+                    dict,
+                    environment.EnvState,
+                    chex.Array,
+                    chex.Array,
+                    chex.PRNGKey,
+                ]:
+                    """Generates training checkpoints.
+
+                    Parameters
+                    ----------
+                    timestep : int
+                        Timestep.
+                    runner_state : Tuple[ TrainState, TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.Array, chex.PRNGKey, ]
+                        Training state.
+
+                    Returns
+                    -------
+                    Tuple[ TrainState, TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.Array, chex.PRNGKey, ]
+                        Un-modified training state.
+                    """
+                    jax.debug.callback(_checkpointing_callback, timestep, runner_state)
+                    return runner_state
+
+                def _no_op_checkpoint(
+                    timestep: int,
+                    runner_state: Tuple[
+                        TrainState,
+                        TrainState,
+                        TrainState,
+                        dict,
+                        environment.EnvState,
+                        chex.Array,
+                        chex.Array,
+                        chex.PRNGKey,
+                    ],
+                ) -> Tuple[
+                    TrainState,
+                    TrainState,
+                    TrainState,
+                    dict,
+                    environment.EnvState,
+                    chex.Array,
+                    chex.Array,
+                    chex.PRNGKey,
+                ]:
+                    """No-op that returns unchanged training state.
+
+                    Parameters
+                    ----------
+                    timestep : int
+                        Timestep.
+                    runner_state : Tuple[ TrainState, TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.Array, chex.PRNGKey, ]
+                        Training state.
+
+                    Returns
+                    -------
+                    Tuple[ TrainState, TrainState, TrainState, dict, environment.EnvState, chex.Array, chex.Array, chex.PRNGKey, ]
+                        Un-modified training state.
+                    """
+                    return runner_state
+
+                # If checkpointing interval condition is met, then save a checkpoint
+                runner_state = jax.lax.cond(
+                    info["timestep"] % args.checkpoint_interval == 0,
+                    _checkpoint,
+                    _no_op_checkpoint,
+                    *(info["timestep"], runner_state),
+                )
+
             return runner_state, metric
 
         # Run training
@@ -1060,8 +1243,21 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
             obs,
             train_key,
         )
+
+        # Restore training state from checkpoint, if specified
+        if args.resume:
+            checkpointer = ocp.PyTreeCheckpointer()
+            restored_runner_state = checkpointer.restore(
+                args.resume_checkpoint_path, item=runner_state
+            )
+            runner_state = restored_runner_state
+
+        # Initialize number of total training timesteps
+        train_timesteps = (
+            args.total_timesteps - args.learning_starts - runner_state[0].step
+        )
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, args.training_timesteps
+            _update_step, runner_state, None, train_timesteps
         )
         return {"runner_state": runner_state, "metrics": metric}
 
@@ -1071,17 +1267,19 @@ def make_train(args: Args) -> Callable[[chex.PRNGKey], dict]:
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
-    # Set up experiment identification
-    run_name = f"{args.exp_name}"
-    wandb_id = wandb.util.generate_id()
-    run_id = f"{run_name}_{wandb_id}"
+    # If experiment identification isn't already given, create it
+    if args.resume and args.run_id is not None:
+        run_id = args.run_id
+    else:
+        run_name = f"{args.exp_name}"
+        wandb_id = wandb.util.generate_id()
+        run_id = f"{run_name}_{wandb_id}"
 
     # If tracking, set up wandb experiment
     if args.track:
         # If a unique wandb run id is given, then resume from that, otherwise
         # generate new run for resuming
         if args.resume and args.run_id is not None:
-            run_id = args.run_id
             wandb.init(
                 id=run_id,
                 dir=args.wandb_dir,
@@ -1093,6 +1291,7 @@ if __name__ == "__main__":
                 mode="online",
             )
         else:
+            args.run_id = run_id
             wandb.init(
                 id=run_id,
                 dir=args.wandb_dir,
@@ -1111,7 +1310,7 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
 
     # Compile training function
-    train_vjit = jax.jit(make_train(args))
+    train = make_train(args)
 
     # Run training
-    train_output = jax.block_until_ready(train_vjit(key))
+    train_output = jax.block_until_ready(train(key))
